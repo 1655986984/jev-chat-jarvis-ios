@@ -1,0 +1,72 @@
+# 构建"未签名" ipa：零配置，产物给 TrollStore 直装 / 本机重签工具用
+# 同时把 App Group entitlements 注入二进制（否则 App 和键盘无法共享配置）
+name: Build IPA (Unsigned)
+
+on:
+  push:
+    branches: [ master, main ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 40
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install xcodegen
+        run: brew install xcodegen
+
+      - name: Generate Xcode project
+        run: xcodegen generate
+
+      - name: Archive (no code signing)
+        run: |
+          set -euo pipefail
+          xcodebuild archive \
+            -project JevJarvis.xcodeproj \
+            -scheme JevJarvis \
+            -configuration Release \
+            -destination 'generic/platform=iOS' \
+            -archivePath build/JevJarvis.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            CODE_SIGNING_REQUIRED=NO \
+            CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM=""
+
+      - name: Package IPA (ad-hoc + entitlements)
+        run: |
+          set -euo pipefail
+          APP_PATH=$(ls -d build/JevJarvis.xcarchive/Products/Applications/*.app)
+          APP_NAME=$(basename "$APP_PATH")
+          rm -rf Payload
+          mkdir -p Payload
+          cp -R "$APP_PATH" "Payload/$APP_NAME"
+
+          # 1) 键盘扩展：注入 entitlements（App Group 必需）
+          codesign --force --sign - \
+            --entitlements Keyboard/JevKeyboard.entitlements \
+            "Payload/$APP_NAME/PlugIns/JevKeyboard.appex"
+
+          # 2) 主 App：注入 entitlements
+          codesign --force --sign - \
+            --entitlements App/JevJarvis.entitlements \
+            "Payload/$APP_NAME"
+
+          # 冒烟检查：把两份 entitlements 打进日志
+          echo '== App entitlements =='
+          codesign -d --entitlements - "Payload/$APP_NAME" 2>&1 | head -60 || true
+          echo '== Keyboard entitlements =='
+          codesign -d --entitlements - "Payload/$APP_NAME/PlugIns/JevKeyboard.appex" 2>&1 | head -60 || true
+
+          zip -qry JevJarvis-unsigned.ipa Payload
+          ls -lh JevJarvis-unsigned.ipa
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: JevJarvis-unsigned-ipa
+          path: JevJarvis-unsigned.ipa
+          if-no-files-found: error
+          retention-days: 30
